@@ -4,10 +4,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import GPT2Config, GPT2PreTrainedModel, LogitsProcessorList
-from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
+from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions, BaseModelOutputWithPastAndCrossAttentions
 from transformers.utils.model_parallel_utils import get_device_map, assert_device_map
 from tortoise.models.arch_util import AttentionBlock
 from tortoise.utils.typical_sampling import TypicalLogitsWarper
+import numpy as np
+import os
+import tvm
+from tvm import relax, runtime
+from tvm import device as tvm_device
+from tvm import target as tvm_target
 
 
 def null_position_embeddings(range, dim):
@@ -46,6 +52,18 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
         self.model_parallel = False
         self.device_map = None
         self.cached_mel_emb = None
+        self.vm = None
+        if 'USE_TVM_MODEL'  in os.environ:
+            target = tvm_target.Target("nvidia/geforce-rtx-3070", host="llvm")
+            self.dev = tvm_device(target.kind.name, 0)
+            models_path = os.environ['TVM_MODELS_DIR']
+            libname = os.path.join(models_path, 'autoregressive.so')
+            print("TVM:", libname) #debug message
+            lib = runtime.load_module(libname)
+            self.vm = relax.VirtualMachine(lib, self.dev)
+            self.kv_caches = None
+            self.shape = 0
+
     def parallelize(self, device_map=None):
         self.device_map = (
             get_device_map(len(self.transformer.h), range(max(1, torch.cuda.device_count())))
@@ -147,31 +165,58 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
             emb = emb + self.text_pos_embedding.get_fixed_embedding(
                 attention_mask.shape[1] - mel_len, attention_mask.device
             )
-        transformer_outputs = self.transformer(
-            inputs_embeds=emb,
-            past_key_values=past_key_values,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            head_mask=head_mask,
-            encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=encoder_attention_mask,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-        hidden_states = transformer_outputs[0]
 
-        # Set device for model parallelism
-        if self.model_parallel:
-            if torch.backends.mps.is_available():
-                self.to(self.transformer.first_device)
+        if 'USE_TVM_MODEL'  in os.environ:
+            if self.kv_caches == None:
+                self.kv_caches = self.vm[f"create_kv_cache_{emb.shape[0]}"]()
+            if self.shape == 0:
+                self.shape = emb.shape[1]
+                seq_len_shape = tvm.runtime.ShapeTuple([emb.shape[1]])
+                i_input_embeds = tvm.nd.array(emb.cpu().numpy().astype(np.float16), self.dev)
+                res = self.vm[f"tortoise_autoregressive_{emb.shape[0]}"](
+                                                         seq_len_shape,
+                                                         i_input_embeds,
+                                                         self.kv_caches)
             else:
-                torch.cuda.set_device(self.transformer.first_device)
-            hidden_states = hidden_states.to(self.lm_head.weight.device)
+                self.shape += 1
+                inpt = emb[:, -1, :].cpu().numpy().astype(np.float16)
+                inpt = np.reshape(inpt, (emb.shape[0], 1, emb.shape[2]))
+                i_input_embeds = tvm.nd.array(inpt, self.dev)
+                seq_len_shape = tvm.runtime.ShapeTuple([self.shape])
+                res = self.vm[f"tortoise_autoregressive_step_{emb.shape[0]}"](
+                                                              seq_len_shape,
+                                                              i_input_embeds,
+                                                              self.kv_caches)
 
-        lm_logits = self.lm_head(hidden_states)
+            lm_logits = torch.from_dlpack(res[0].to_dlpack()).to("cuda")
+            transformer_outputs = BaseModelOutputWithPastAndCrossAttentions()
+
+        else:
+            transformer_outputs = self.transformer(
+                inputs_embeds=emb,
+                past_key_values=past_key_values,
+                attention_mask=attention_mask,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                head_mask=head_mask,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+            hidden_states = transformer_outputs[0]
+
+            # Set device for model parallelism
+            if self.model_parallel:
+                if torch.backends.mps.is_available():
+                    self.to(self.transformer.first_device)
+                else:
+                    torch.cuda.set_device(self.transformer.first_device)
+                hidden_states = hidden_states.to(self.lm_head.weight.device)
+
+            lm_logits = self.lm_head(hidden_states)
 
         if not return_dict:
             return (lm_logits,) + transformer_outputs[1:]

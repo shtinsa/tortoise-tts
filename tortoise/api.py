@@ -402,6 +402,8 @@ class TextToSpeech:
                 with self.temporary_cuda(self.autoregressive
                 ) as autoregressive, torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.half):
                     for b in tqdm(range(num_batches), disable=not verbose):
+                        if 'USE_TVM_MODEL'  in os.environ:
+                            autoregressive.inference_model.shape = 0
                         codes = autoregressive.inference_speech(auto_conditioning, text_tokens,
                                                                     do_sample=True,
                                                                     top_p=top_p,

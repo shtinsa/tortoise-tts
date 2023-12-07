@@ -3,9 +3,11 @@ import os
 
 import torch
 import torchaudio
-
+import time
 from api import TextToSpeech, MODELS_DIR
 from utils.audio import load_voices
+
+PROFILE=False
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -19,7 +21,7 @@ if __name__ == '__main__':
     parser.add_argument('--output_path', type=str, help='Where to store outputs.', default='results/')
     parser.add_argument('--model_dir', type=str, help='Where to find pretrained model checkpoints. Tortoise automatically downloads these to .models, so this'
                                                       'should only be specified if you have custom checkpoints.', default=MODELS_DIR)
-    parser.add_argument('--candidates', type=int, help='How many output candidates to produce per-voice.', default=3)
+    parser.add_argument('--candidates', type=int, help='How many output candidates to produce per-voice.', default=1)
     parser.add_argument('--seed', type=int, help='Random seed which can be used to reproduce results.', default=None)
     parser.add_argument('--produce_debug_state', type=bool, help='Whether or not to produce debug_state.pth, which can aid in reproducing problems. Defaults to true.', default=True)
     parser.add_argument('--cvvp_amount', type=float, help='How much the CVVP model should influence the output.'
@@ -37,9 +39,27 @@ if __name__ == '__main__':
         else:
             voice_sel = [selected_voice]
         voice_samples, conditioning_latents = load_voices(voice_sel)
+        backend = "PYTORCH"
+        if 'USE_TVM_MODEL'  in os.environ:
+            backend = "TVM"
+        start_tm = time.time()
+        if PROFILE == False:
+            gen, dbg_state = tts.tts_with_preset(args.text, k=args.candidates, voice_samples=voice_samples, conditioning_latents=conditioning_latents,
+                                      preset=args.preset, use_deterministic_seed=args.seed, return_deterministic_state=True, cvvp_amount=args.cvvp_amount)
+        else:
+            from torch.profiler import profile, ProfilerActivity
+            with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], profile_memory=True, with_modules=False, with_stack=True) as prof:
+                gen, dbg_state = tts.tts_with_preset(args.text, k=args.candidates, voice_samples=voice_samples, conditioning_latents=conditioning_latents,
+                                        preset=args.preset, use_deterministic_seed=args.seed, return_deterministic_state=True, cvvp_amount=args.cvvp_amount)
+            os.makedirs("traces",exist_ok=True)
+            export_traces = f'./traces/trace_neonjb_{backend}.json'
+            export_logs = f"./traces/trace_neonjb_{backend}.txt"
 
-        gen, dbg_state = tts.tts_with_preset(args.text, k=args.candidates, voice_samples=voice_samples, conditioning_latents=conditioning_latents,
-                                  preset=args.preset, use_deterministic_seed=args.seed, return_deterministic_state=True, cvvp_amount=args.cvvp_amount)
+            prof.export_chrome_trace(export_traces)
+            with open(export_logs, 'w') as fle:
+                fle.write("{}".format(prof.key_averages(group_by_stack_n=5).table(sort_by="self_cuda_time_total")))
+
+        print(f"{backend} Infer time:", time.time() - start_tm, ' sec.')
         if isinstance(gen, list):
             for j, g in enumerate(gen):
                 torchaudio.save(os.path.join(args.output_path, f'{selected_voice}_{k}_{j}.wav'), g.squeeze(0).cpu(), 24000)
