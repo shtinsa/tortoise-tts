@@ -26,6 +26,11 @@ from tortoise.utils.wav2vec_alignment import Wav2VecAlignment
 from contextlib import contextmanager
 from tortoise.models.stream_generator import init_stream_support
 from huggingface_hub import hf_hub_download
+import os
+import sys
+import tvm
+from tvm import relax
+from tvm import nd
 pbar = None
 init_stream_support()
 DEFAULT_MODELS_DIR = os.path.join(os.path.expanduser('~'), '.cache', 'tortoise', 'models')
@@ -69,7 +74,7 @@ def load_discrete_vocoder_diffuser(trained_diffusion_steps=4000, desired_diffusi
                            conditioning_free=cond_free, conditioning_free_k=cond_free_k)
 
 
-def format_conditioning(clip, cond_length=132300, device="cuda" if not torch.backends.mps.is_available() else 'mps'):
+def format_conditioning(clip, cond_length=132300, device="cuda", tvm_func=None):
     """
     Converts the given conditioning signal to a MEL spectrogram and clips it as expected by the models.
     """
@@ -78,8 +83,14 @@ def format_conditioning(clip, cond_length=132300, device="cuda" if not torch.bac
         clip = F.pad(clip, pad=(0, abs(gap)))
     elif gap > 0:
         rand_start = random.randint(0, gap)
-        clip = clip[:, rand_start:rand_start + cond_length]
-    mel_clip = TorchMelSpectrogram()(clip.unsqueeze(0)).squeeze(0)
+        clip = clip[:, rand_start : rand_start + cond_length]
+    if 'USE_TVM_MODEL' in os.environ:
+        tvm_sample = tvm.nd.from_dlpack(torch.tensor(clip, device=device))
+        res = tvm_func['format_conditional_132300'](tvm_sample)
+        mel_clip = torch.from_dlpack(res)
+        return mel_clip
+    else:
+        mel_clip = TorchMelSpectrogram()(clip.unsqueeze(0)).squeeze(0)
     return mel_clip.unsqueeze(0).to(device)
 
 
@@ -170,6 +181,9 @@ def pick_best_batch_size_for_gpu():
             return 4
     return 1
 
+target = tvm.target.Target("nvidia/geforce-rtx-3070", host="llvm")
+dev_ = tvm.device(target.kind.name, 0)
+
 class TextToSpeech:
     """
     Main entry point into Tortoise.
@@ -215,14 +229,23 @@ class TextToSpeech:
             self.autoregressive.load_state_dict(torch.load(get_model_path('autoregressive.pth', models_dir)), strict=False)
             self.autoregressive.post_init_gpt2_config(use_deepspeed=use_deepspeed, kv_cache=kv_cache, half=self.half)
 
+        if 'USE_TVM_MODEL' in os.environ:
+            models_path = os.environ['TVM_MODELS_DIR']
+            lib = tvm.runtime.load_module(f'{models_path}/test_autoregressive_cuda_0_float32.so')
+            self.autoregressive_cond = relax.VirtualMachine(lib, dev_)
+            lib = tvm.runtime.load_module(f'{models_path}/test_FC_cuda_0_float32.so')
+            self.format_conditional = relax.VirtualMachine(lib, dev_)
+
         self.hifi_decoder = HifiganGenerator(in_channels=1024, out_channels = 1, resblock_type = "1",
         resblock_dilation_sizes = [[1, 3, 5], [1, 3, 5], [1, 3, 5]], resblock_kernel_sizes = [3, 7, 11],
         upsample_kernel_sizes = [16, 16, 4, 4], upsample_initial_channel = 512, upsample_factors = [8, 8, 2, 2],
         cond_channels=1024).to(self.device).eval()
+      
         hifi_model = torch.load(get_model_path('hifidecoder.pth'))
         self.hifi_decoder.load_state_dict(hifi_model, strict=False)
         # Random latent generators (RLGs) are loaded lazily.
         self.rlg_auto = None
+
     def get_conditioning_latents(self, voice_samples, return_mels=False):
         """
         Transforms one or more voice_samples into a tuple (autoregressive_conditioning_latent, diffusion_conditioning_latent).
@@ -234,12 +257,19 @@ class TextToSpeech:
             voice_samples = [v.to(self.device) for v in voice_samples]
 
             auto_conds = []
-            if not isinstance(voice_samples, list):
-                voice_samples = [voice_samples]
-            for vs in voice_samples:
-                auto_conds.append(format_conditioning(vs, device=self.device))
+
+            for ls in voice_samples:
+                if "USE_TVM_MODEL" in os.environ:
+                    auto_conds.append(format_conditioning(ls, device=self.device, tvm_func=self.format_conditional))
+                else:
+                    auto_conds.append(format_conditioning(ls, device=self.device))
             auto_conds = torch.stack(auto_conds, dim=1)
-            auto_latent = self.autoregressive.get_conditioning(auto_conds)
+            if "USE_TVM_MODEL" in os.environ:
+                tvm_auto_conds = tvm.nd.from_dlpack(auto_conds)
+                res = self.autoregressive_cond['autoregressive_517'](tvm_auto_conds)
+                auto_latent = torch.from_dlpack(res)
+            else:
+                auto_latent = self.autoregressive.get_conditioning(auto_conds)
 
         if return_mels:
             return auto_latent
@@ -465,7 +495,10 @@ class TextToSpeech:
         text_tokens = F.pad(text_tokens, (0, 1))  # This may not be necessary.
         assert text_tokens.shape[-1] < 400, 'Too much text provided. Break the text up into separate segments and re-try inference.'
         if voice_samples is not None:
+            import time
+            st_time = time.time()
             auto_conditioning = self.get_conditioning_latents(voice_samples, return_mels=False)
+            print("CONDITIONING LATENTS:   ", time.time() - st_time)
         else:
             auto_conditioning  = self.get_random_conditioning_latents()
         auto_conditioning = auto_conditioning.to(self.device)
@@ -477,6 +510,10 @@ class TextToSpeech:
             with torch.autocast(
                     device_type="cuda" , dtype=torch.float16, enabled=self.half
                 ):
+                import time
+                st_time = time.time()
+                if 'USE_TVM_MODEL'  in os.environ:
+                    self.autoregressive.inference_model.shape = 0
                 codes = self.autoregressive.inference_speech(auto_conditioning, text_tokens,
                                                             top_k=50,
                                                             top_p=top_p,
@@ -493,9 +530,20 @@ class TextToSpeech:
                                 torch.tensor([text_tokens.shape[-1]], device=text_tokens.device), codes,
                                 torch.tensor([codes.shape[-1]*self.autoregressive.mel_length_compression], device=text_tokens.device),
                                 return_latent=True, clip_inputs=False)
+                print("AUTOREGRESSIVE: ", time.time() - st_time)
             if verbose:
                 print("generating audio..")
-            wav_gen = self.hifi_decoder.inference(gpt_latents.to(self.device), auto_conditioning)
+          
+            if 'USE_TVM_MODEL' in os.environ:
+                import time
+                st_time = time.time()
+                wav_gen = self.hifi_decoder.run_tvm(gpt_latents.to(self.device), auto_conditioning)
+                print("TVM HIFI TIME: ", time.time() - st_time)
+            else:
+                import time
+                st_time = time.time()
+                wav_gen = self.hifi_decoder.inference(gpt_latents.to(self.device), auto_conditioning)
+                print("TORCH HIFI TIME: ", time.time() - st_time)
             return wav_gen
     def deterministic_state(self, seed=None):
         """
