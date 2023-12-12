@@ -10,11 +10,9 @@ from tortoise.models.arch_util import AttentionBlock
 from tortoise.utils.typical_sampling import TypicalLogitsWarper
 import numpy as np
 import os
-import tvm
-from tvm import relax, runtime
+from tvm import relax, runtime, nd
 from tvm import device as tvm_device
 from tvm import target as tvm_target
-
 
 def null_position_embeddings(range, dim):
     return torch.zeros((range.shape[0], range.shape[1], dim), device=range.device)
@@ -63,6 +61,8 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
             self.vm = relax.VirtualMachine(lib, self.dev)
             self.kv_caches = None
             self.shape = 0
+            self.offset = 2
+            self.fake_out = (([1],),)
 
     def parallelize(self, device_map=None):
         self.device_map = (
@@ -97,7 +97,7 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
         token_type_ids = kwargs.get("token_type_ids", None)  # usually None
         if not self.kv_cache:
             past_key_values = None
-        # only last token for inputs_ids if past is defined in kwargs
+
         if past_key_values:
             input_ids = input_ids[:, -1].unsqueeze(-1)
             if token_type_ids is not None:
@@ -149,6 +149,7 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
 
         # Create embedding
         mel_len = self.cached_mel_emb.shape[1]
+
         if input_ids.shape[1] != 1:
             text_inputs = input_ids[:, mel_len:]
             text_emb = self.embeddings(text_inputs)
@@ -161,36 +162,39 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
                 mel_emb = self.cached_mel_emb
             emb = torch.cat([mel_emb, text_emb], dim=1)
         else:
-            emb = self.embeddings(input_ids)
-            emb = emb + self.text_pos_embedding.get_fixed_embedding(
-                attention_mask.shape[1] - mel_len, attention_mask.device
-            )
-
+            if not 'USE_TVM_MODEL'  in os.environ:
+                emb = self.embeddings(input_ids)
+                emb = emb + self.text_pos_embedding.get_fixed_embedding(
+                    attention_mask.shape[1] - mel_len, attention_mask.device
+                )
         if 'USE_TVM_MODEL'  in os.environ:
             if self.kv_caches == None:
                 self.kv_caches = self.vm[f"create_kv_cache_{emb.shape[0]}"]()
-            if self.shape == 0:
+            if input_ids.shape[1] != 1:
                 self.shape = emb.shape[1]
-                seq_len_shape = tvm.runtime.ShapeTuple([emb.shape[1]])
-                i_input_embeds = tvm.nd.array(emb.cpu().numpy().astype(np.float16), self.dev)
+                self.offset = 2
+                seq_len_shape = runtime.ShapeTuple([emb.shape[1]])
+                i_input_embeds = nd.array(emb.cpu().numpy().astype(np.float16), self.dev)
                 res = self.vm[f"tortoise_autoregressive_{emb.shape[0]}"](
                                                          seq_len_shape,
                                                          i_input_embeds,
                                                          self.kv_caches)
             else:
                 self.shape += 1
-                inpt = emb[:, -1, :].cpu().numpy().astype(np.float16)
-                inpt = np.reshape(inpt, (emb.shape[0], 1, emb.shape[2]))
-                i_input_embeds = tvm.nd.array(inpt, self.dev)
-                seq_len_shape = tvm.runtime.ShapeTuple([self.shape])
-                res = self.vm[f"tortoise_autoregressive_step_{emb.shape[0]}"](
+                input = nd.array(input_ids.cpu().numpy().astype(np.int32), self.dev)
+                offset = nd.array(np.array([self.offset]).astype(np.int32), self.dev)
+
+                seq_len_shape = runtime.ShapeTuple([self.shape])
+
+                res = self.vm[f"tortoise_autoregressive_step_{input_ids.shape[0]}"](
                                                               seq_len_shape,
-                                                              i_input_embeds,
+                                                              input,
+                                                              offset,
                                                               self.kv_caches)
-
+                self.offset += 1
             lm_logits = torch.from_dlpack(res[0].to_dlpack()).to("cuda")
-            transformer_outputs = BaseModelOutputWithPastAndCrossAttentions()
-
+            transformer_outputs = CausalLMOutputWithCrossAttentions()
+            transformer_outputs.past_key_values = self.fake_out # to avoid changes in other code
         else:
             transformer_outputs = self.transformer(
                 inputs_embeds=emb,
@@ -217,7 +221,6 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
                 hidden_states = hidden_states.to(self.lm_head.weight.device)
 
             lm_logits = self.lm_head(hidden_states)
-
         if not return_dict:
             return (lm_logits,) + transformer_outputs[1:]
 
