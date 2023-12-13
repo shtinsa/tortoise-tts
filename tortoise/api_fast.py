@@ -231,9 +231,9 @@ class TextToSpeech:
 
         if 'USE_TVM_MODEL' in os.environ:
             models_path = os.environ['TVM_MODELS_DIR']
-            lib = tvm.runtime.load_module(f'{models_path}/test_autoregressive_cuda_0_float32.so')
+            lib = tvm.runtime.load_module(f'{models_path}/autoregressive_cond.so')
             self.autoregressive_cond = relax.VirtualMachine(lib, dev_)
-            lib = tvm.runtime.load_module(f'{models_path}/test_FC_cuda_0_float32.so')
+            lib = tvm.runtime.load_module(f'{models_path}/format_cond.so')
             self.format_conditional = relax.VirtualMachine(lib, dev_)
 
         self.hifi_decoder = HifiganGenerator(in_channels=1024, out_channels = 1, resblock_type = "1",

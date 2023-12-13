@@ -85,7 +85,7 @@ def format_conditioning(clip, cond_length=132300, device="cuda", tvm_func=None):
         rand_start = random.randint(0, gap)
         clip = clip[:, rand_start : rand_start + cond_length]
     if 'USE_TVM_MODEL' in os.environ:
-        tvm_sample = tvm.nd.from_dlpack(torch.tensor(clip, device=device))
+        tvm_sample = tvm.nd.from_dlpack(torch.tensor(clip.clone().detach(), device=device))
         res = tvm_func['format_conditional_132300'](tvm_sample)
         mel_clip = torch.from_dlpack(res)
         return mel_clip
@@ -223,13 +223,13 @@ class TextToSpeech:
         else:
             if "USE_TVM_MODEL" in os.environ:
                 models_path = os.environ['TVM_MODELS_DIR']
-                lib = tvm.runtime.load_module(f'{models_path}/test_autoregressive_cuda_0_float32.so')
+                lib = tvm.runtime.load_module(f'{models_path}/autoregressive_cond.so')
                 self.autoregressive_cond = relax.VirtualMachine(lib, dev_)
-                lib = tvm.runtime.load_module(f'{models_path}/test_diffusion_cuda_0_float32.so')
+                lib = tvm.runtime.load_module(f'{models_path}/diffusion_cond.so')
                 self.diffusion_cond = relax.VirtualMachine(lib, dev_)
-                lib = tvm.runtime.load_module(f'{models_path}/test_Wav2Mel_cuda_0_float32.so')
+                lib = tvm.runtime.load_module(f'{models_path}/wav2mel.so')
                 self.wav2mel = relax.VirtualMachine(lib, dev_)
-                lib = tvm.runtime.load_module(f'{models_path}/test_FC_cuda_0_float32.so')
+                lib = tvm.runtime.load_module(f'{models_path}/format_cond.so')
                 self.format_conditional = relax.VirtualMachine(lib, dev_)
             else:
                 self.format_conditional = None
@@ -262,6 +262,10 @@ class TextToSpeech:
         self.rlg_diffusion = None
     @contextmanager
     def temporary_cuda(self, model):
+        # # print(type(model))
+        # if 'USE_TVM_MODEL'  in os.environ and isinstance(model, UnifiedVoice) :
+        #     yield model
+        # else:
         m = model.to(self.device)
         yield m
         m = model.cpu()
@@ -287,7 +291,10 @@ class TextToSpeech:
             if not isinstance(voice_samples, list):
                 voice_samples = [voice_samples]
             for vs in voice_samples:
-                auto_conds.append(format_conditioning(vs, device=self.device))
+                if "USE_TVM_MODEL" in os.environ:
+                    auto_conds.append(format_conditioning(vs, device=self.device, tvm_func=self.format_conditional))
+                else:
+                    auto_conds.append(format_conditioning(vs, device=self.device))
             auto_conds = torch.stack(auto_conds, dim=1)
             if "USE_TVM_MODEL" in os.environ:
                 tvm_auto_conds = tvm.nd.from_dlpack(auto_conds)
@@ -319,8 +326,8 @@ class TextToSpeech:
                 self.diffusion = self.diffusion.to(self.device)
                 diffusion_latent = self.diffusion.get_conditioning(diffusion_conds)
                 self.diffusion = self.diffusion.cpu()
-        import pdb
-        pdb.set_trace()
+        # import pdb
+        # pdb.set_trace()
         if return_mels:
             return auto_latent, diffusion_latent, auto_conds, diffusion_conds
         else:

@@ -52,6 +52,7 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
         self.cached_mel_emb = None
         self.vm = None
         if 'USE_TVM_MODEL'  in os.environ:
+            self.text_pos_embedding.to('cuda')
             target = tvm_target.Target("nvidia/geforce-rtx-3070", host="llvm")
             self.dev = tvm_device(target.kind.name, 0)
             models_path = os.environ['TVM_MODELS_DIR']
@@ -280,6 +281,8 @@ class LearnedPositionEmbeddings(nn.Module):
     def __init__(self, seq_len, model_dim, init=.02):
         super().__init__()
         self.emb = nn.Embedding(seq_len, model_dim)
+        if "USE_TVM_MODEL" in os.environ:
+            self.emb.to('cuda')
         # Initializing this way is standard for GPT-2
         self.emb.weight.data.normal_(mean=0.0, std=init)
 
@@ -379,13 +382,19 @@ class UnifiedVoice(nn.Module):
         self.max_conditioning_inputs = max_conditioning_inputs
         self.mel_length_compression = mel_length_compression
         self.conditioning_encoder = ConditioningEncoder(80, model_dim, num_attn_heads=heads)
+
         self.text_embedding = nn.Embedding(self.number_text_tokens*types+1, model_dim)
+        if 'USE_TVM_MODEL'  in os.environ:
+            self.text_embedding.to('cuda')
+            self.text_embedding.weight.to('cuda')
         if use_mel_codes_as_input:
             self.mel_embedding = nn.Embedding(self.number_mel_codes, model_dim)
         else:
             self.mel_embedding = MelEncoder(model_dim, resblocks_per_reduction=1)
         self.gpt, self.mel_pos_embedding, self.text_pos_embedding, self.mel_layer_pos_embedding, self.text_layer_pos_embedding = \
             build_hf_gpt_transformer(layers, model_dim, heads, self.max_mel_tokens+2+self.max_conditioning_inputs, self.max_text_tokens+2, checkpointing)
+        if 'USE_TVM_MODEL'  in os.environ:
+            self.text_pos_embedding.to('cuda')
         if train_solo_embeddings:
             self.mel_solo_embedding = nn.Parameter(torch.randn(1, 1, model_dim) * .02, requires_grad=True)
             self.text_solo_embedding = nn.Parameter(torch.randn(1, 1, model_dim) * .02, requires_grad=True)
@@ -585,7 +594,8 @@ class UnifiedVoice(nn.Module):
 
         text_inputs = F.pad(text_inputs, (0, 1), value=self.stop_text_token)
         text_inputs, _ = self.build_aligned_inputs_and_targets(text_inputs, self.start_text_token, self.stop_text_token)
-        text_emb = self.text_embedding(text_inputs) + self.text_pos_embedding(text_inputs)
+        text_emb = self.text_embedding(text_inputs)
+        text_emb += self.text_pos_embedding(text_inputs)
 
         conds = speech_conditioning_latent.unsqueeze(1)
         emb = torch.cat([conds, text_emb], dim=1)
