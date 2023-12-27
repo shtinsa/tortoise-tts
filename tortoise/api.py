@@ -263,12 +263,12 @@ class TextToSpeech:
     @contextmanager
     def temporary_cuda(self, model):
         # # print(type(model))
-        # if 'USE_TVM_MODEL'  in os.environ and isinstance(model, UnifiedVoice) :
-        #     yield model
-        # else:
-        m = model.to(self.device)
-        yield m
-        m = model.cpu()
+        if 'USE_TVM_MODEL' in os.environ and isinstance(model, UnifiedVoice) :
+            yield model
+        else:
+            m = model.to(self.device)
+            yield m
+            m = model.cpu()
 
     
     def load_cvvp(self):

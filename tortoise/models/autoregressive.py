@@ -150,35 +150,18 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
 
         # Create embedding
         mel_len = self.cached_mel_emb.shape[1]
-
-        if input_ids.shape[1] != 1:
-            text_inputs = input_ids[:, mel_len:]
-            text_emb = self.embeddings(text_inputs)
-            text_emb = text_emb + self.text_pos_embedding(text_emb)
-            if self.cached_mel_emb.shape[0] != text_emb.shape[0]:
-                mel_emb = self.cached_mel_emb.repeat_interleave(
-                    text_emb.shape[0] // self.cached_mel_emb.shape[0], 0
-                )
-            else:  # this outcome only occurs once per loop in most cases
-                mel_emb = self.cached_mel_emb
-            emb = torch.cat([mel_emb, text_emb], dim=1)
-        else:
-            if not 'USE_TVM_MODEL'  in os.environ:
-                emb = self.embeddings(input_ids)
-                emb = emb + self.text_pos_embedding.get_fixed_embedding(
-                    attention_mask.shape[1] - mel_len, attention_mask.device
-                )
         if 'USE_TVM_MODEL'  in os.environ:
+            batch = input_ids.shape[0]
             if self.kv_caches == None:
-                self.kv_caches = self.vm[f"create_kv_cache_{emb.shape[0]}"]()
+                self.kv_caches = self.vm[f"create_kv_cache_{batch}"]()
             if input_ids.shape[1] != 1:
-                self.shape = emb.shape[1]
+                self.shape = self.cached_mel_emb.shape[1]
                 self.offset = 2
-                seq_len_shape = runtime.ShapeTuple([emb.shape[1]])
-                i_input_embeds = nd.array(emb.cpu().numpy().astype(np.float16), self.dev)
-                res = self.vm[f"tortoise_autoregressive_{emb.shape[0]}"](
+                seq_len_shape = runtime.ShapeTuple([self.shape])
+                # i_input_embeds = nd.array(emb.cpu().numpy().astype(np.float16), self.dev)
+                res = self.vm[f"tortoise_autoregressive_{batch}"](
                                                          seq_len_shape,
-                                                         i_input_embeds,
+                                                         self.cached_mel_emb,
                                                          self.kv_caches)
             else:
                 self.shape += 1
@@ -187,7 +170,7 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
 
                 seq_len_shape = runtime.ShapeTuple([self.shape])
 
-                res = self.vm[f"tortoise_autoregressive_step_{input_ids.shape[0]}"](
+                res = self.vm[f"tortoise_autoregressive_step_{batch}"](
                                                               seq_len_shape,
                                                               input,
                                                               offset,
@@ -197,6 +180,23 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
             transformer_outputs = CausalLMOutputWithCrossAttentions()
             transformer_outputs.past_key_values = self.fake_out # to avoid changes in other code
         else:
+            if input_ids.shape[1] != 1:
+                text_inputs = input_ids[:, mel_len:]
+                text_emb = self.embeddings(text_inputs)
+                text_emb = text_emb + self.text_pos_embedding(text_emb)
+                if self.cached_mel_emb.shape[0] != text_emb.shape[0]:
+                    mel_emb = self.cached_mel_emb.repeat_interleave(
+                        text_emb.shape[0] // self.cached_mel_emb.shape[0], 0
+                    )
+                else:  # this outcome only occurs once per loop in most cases
+                    mel_emb = self.cached_mel_emb
+                emb = torch.cat([mel_emb, text_emb], dim=1)
+            else:
+                emb = self.embeddings(input_ids)
+                emb = emb + self.text_pos_embedding.get_fixed_embedding(
+                    attention_mask.shape[1] - mel_len, attention_mask.device
+                )
+
             transformer_outputs = self.transformer(
                 inputs_embeds=emb,
                 past_key_values=past_key_values,
@@ -384,17 +384,14 @@ class UnifiedVoice(nn.Module):
         self.conditioning_encoder = ConditioningEncoder(80, model_dim, num_attn_heads=heads)
 
         self.text_embedding = nn.Embedding(self.number_text_tokens*types+1, model_dim)
-        if 'USE_TVM_MODEL'  in os.environ:
-            self.text_embedding.to('cuda')
-            self.text_embedding.weight.to('cuda')
+
         if use_mel_codes_as_input:
             self.mel_embedding = nn.Embedding(self.number_mel_codes, model_dim)
         else:
             self.mel_embedding = MelEncoder(model_dim, resblocks_per_reduction=1)
         self.gpt, self.mel_pos_embedding, self.text_pos_embedding, self.mel_layer_pos_embedding, self.text_layer_pos_embedding = \
             build_hf_gpt_transformer(layers, model_dim, heads, self.max_mel_tokens+2+self.max_conditioning_inputs, self.max_text_tokens+2, checkpointing)
-        if 'USE_TVM_MODEL'  in os.environ:
-            self.text_pos_embedding.to('cuda')
+
         if train_solo_embeddings:
             self.mel_solo_embedding = nn.Parameter(torch.randn(1, 1, model_dim) * .02, requires_grad=True)
             self.text_solo_embedding = nn.Parameter(torch.randn(1, 1, model_dim) * .02, requires_grad=True)
@@ -544,7 +541,13 @@ class UnifiedVoice(nn.Module):
 
         conds = speech_conditioning_latent.unsqueeze(1)
         text_inputs, text_targets = self.build_aligned_inputs_and_targets(text_inputs, self.start_text_token, self.stop_text_token)
-        text_emb = self.text_embedding(text_inputs) + self.text_pos_embedding(text_inputs)
+        if 'USE_TVM_MODEL' in os.environ:
+            seq_len_shape = runtime.ShapeTuple([text_inputs.shape[1]])
+            i_text = nd.array(text_inputs.cpu().numpy(), self.inference_model.dev)
+            res = self.inference_model.vm[f"embeddings_calculate"](i_text, seq_len_shape)
+            text_emb = torch.from_dlpack(res.to_dlpack()).to("cuda")
+        else:
+            text_emb = self.text_embedding(text_inputs) + self.text_pos_embedding(text_inputs)
         mel_codes, mel_targets = self.build_aligned_inputs_and_targets(mel_codes, self.start_mel_token, self.stop_mel_token)
         if raw_mels is not None:
             mel_inp = F.pad(raw_mels, (0, 8))
@@ -591,14 +594,22 @@ class UnifiedVoice(nn.Module):
         return gpt_inputs
     def inference_speech(self, speech_conditioning_latent, text_inputs, input_tokens=None, num_return_sequences=1,
                          max_generate_length=None, typical_sampling=False, typical_mass=.9, **hf_generate_kwargs):        
-
-        text_inputs = F.pad(text_inputs, (0, 1), value=self.stop_text_token)
-        text_inputs, _ = self.build_aligned_inputs_and_targets(text_inputs, self.start_text_token, self.stop_text_token)
-        text_emb = self.text_embedding(text_inputs)
-        text_emb += self.text_pos_embedding(text_inputs)
-
+        # print("input_tokens ", input_tokens)
         conds = speech_conditioning_latent.unsqueeze(1)
-        emb = torch.cat([conds, text_emb], dim=1)
+        if 'USE_TVM_MODEL' in os.environ:
+            seq_len_shape = runtime.ShapeTuple([text_inputs.shape[1]])
+            i_text = nd.array(text_inputs.cpu().numpy(), self.inference_model.dev)
+            i_speech_conditioning_latent = nd.array(speech_conditioning_latent.cpu().numpy().astype(np.float16), self.inference_model.dev)
+            emb = self.inference_model.vm[f"calc_cashed_1"](i_text, seq_len_shape, i_speech_conditioning_latent)
+        else:
+            text_inputs = F.pad(text_inputs, (0, 1), value=self.stop_text_token)
+            text_inputs, _ = self.build_aligned_inputs_and_targets(text_inputs, self.start_text_token, self.stop_text_token)
+            text_inputs = text_inputs.to("cuda")
+
+            text_emb = self.text_embedding(text_inputs)
+            text_emb += self.text_pos_embedding(text_inputs)
+
+            emb = torch.cat([conds, text_emb], dim=1)
         self.inference_model.store_mel_emb(emb)
 
         fake_inputs = torch.full((emb.shape[0], conds.shape[1] + emb.shape[1],), fill_value=1, dtype=torch.long,
