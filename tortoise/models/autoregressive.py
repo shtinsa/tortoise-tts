@@ -52,7 +52,6 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
         self.cached_mel_emb = None
         self.vm = None
         if 'USE_TVM_MODEL'  in os.environ:
-            self.text_pos_embedding.to('cuda')
             target = tvm_target.Target("nvidia/geforce-rtx-3070", host="llvm")
             self.dev = tvm_device(target.kind.name, 0)
             models_path = os.environ['TVM_MODELS_DIR']
@@ -281,8 +280,6 @@ class LearnedPositionEmbeddings(nn.Module):
     def __init__(self, seq_len, model_dim, init=.02):
         super().__init__()
         self.emb = nn.Embedding(seq_len, model_dim)
-        if "USE_TVM_MODEL" in os.environ:
-            self.emb.to('cuda')
         # Initializing this way is standard for GPT-2
         self.emb.weight.data.normal_(mean=0.0, std=init)
 
@@ -446,9 +443,17 @@ class UnifiedVoice(nn.Module):
             self.inference_model = self.ds_engine.module.eval()
         else:
             self.inference_model = self.inference_model.eval()
+        if 'USE_TVM_MODEL' in os.environ:
+            del self.text_embedding
+            self.text_embedding = None
+            del self.text_pos_embedding
+            self.text_pos_embedding=None
+            # del self.gpt
+            # self.gpt=None
 
         # self.inference_model = PrunedGPT2InferenceModel(gpt_config, self.gpt, self.mel_pos_embedding, self.mel_embedding, self.final_norm, self.mel_head)
-        self.gpt.wte = self.mel_embedding
+        else:
+            self.gpt.wte = self.mel_embedding
     def build_aligned_inputs_and_targets(self, input, start_token, stop_token):
         inp = F.pad(input, (1,0), value=start_token)
         tar = F.pad(input, (0,1), value=stop_token)
