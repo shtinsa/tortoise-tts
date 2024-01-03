@@ -260,10 +260,16 @@ class TextToSpeech:
         # Random latent generators (RLGs) are loaded lazily.
         self.rlg_auto = None
         self.rlg_diffusion = None
+
+        # from tortoise-tts-fast
+        self.diffusion = self.diffusion.to("cuda")
+        self.clvp = self.clvp.to("cuda")
+        self.vocoder = self.vocoder.to("cuda")
+
     @contextmanager
     def temporary_cuda(self, model):
-        # # print(type(model))
-        if 'USE_TVM_MODEL' in os.environ and isinstance(model, UnifiedVoice) :
+        # print(type(model))
+        if 'USE_TVM_MODEL' in os.environ and isinstance(model, (UnifiedVoice, UnivNetGenerator, DiffusionTts, CLVP)):
             yield model
         else:
             m = model.to(self.device)
