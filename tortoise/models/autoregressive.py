@@ -157,7 +157,6 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
                 self.shape = self.cached_mel_emb.shape[1]
                 self.offset = 2
                 seq_len_shape = runtime.ShapeTuple([self.shape])
-                # i_input_embeds = nd.array(emb.cpu().numpy().astype(np.float16), self.dev)
                 res = self.vm[f"tortoise_autoregressive_{batch}"](
                                                          seq_len_shape,
                                                          self.cached_mel_emb,
@@ -175,7 +174,7 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
                                                               offset,
                                                               self.kv_caches)
                 self.offset += 1
-            lm_logits = torch.from_dlpack(res[0].to_dlpack()).to("cuda")
+            lm_logits = torch.from_dlpack(res[0].to_dlpack())
             transformer_outputs = CausalLMOutputWithCrossAttentions()
             transformer_outputs.past_key_values = self.fake_out # to avoid changes in other code
         else:
@@ -448,6 +447,11 @@ class UnifiedVoice(nn.Module):
             self.text_embedding = None
             del self.text_pos_embedding
             self.text_pos_embedding=None
+            del self.mel_embedding
+            self.mel_embedding = None
+            del self.mel_pos_embedding
+            self.mel_pos_embedding=None
+
             # del self.gpt
             # self.gpt=None
 
@@ -478,16 +482,15 @@ class UnifiedVoice(nn.Module):
             emb = torch.cat([speech_conditioning_inputs, first_inputs, second_inputs], dim=1)
         else:
             emb = torch.cat([speech_conditioning_inputs, first_inputs], dim=1)
-
         gpt_out = self.gpt(inputs_embeds=emb, return_dict=True, output_attentions=get_attns)
         if get_attns:
             return gpt_out.attentions
 
         enc = gpt_out.last_hidden_state[:, 1:]  # The first logit is tied to the speech_conditioning_input
         enc = self.final_norm(enc)
-
         if return_latent:
-            return enc[:, speech_conditioning_inputs.shape[1]:speech_conditioning_inputs.shape[1]+first_inputs.shape[1]], enc[:, -second_inputs.shape[1]:]
+            res = enc[:, speech_conditioning_inputs.shape[1]:speech_conditioning_inputs.shape[1]+first_inputs.shape[1]], enc[:, -second_inputs.shape[1]:]
+            return res
 
         first_logits = enc[:, :first_inputs.shape[1]]
         first_logits = first_head(first_logits)
@@ -546,30 +549,45 @@ class UnifiedVoice(nn.Module):
 
         conds = speech_conditioning_latent.unsqueeze(1)
         text_inputs, text_targets = self.build_aligned_inputs_and_targets(text_inputs, self.start_text_token, self.stop_text_token)
-        if 'USE_TVM_MODEL' in os.environ:
-            seq_len_shape = runtime.ShapeTuple([text_inputs.shape[1]])
-            i_text = nd.array(text_inputs.cpu().numpy(), self.inference_model.dev)
-            res = self.inference_model.vm[f"embeddings_calculate"](i_text, seq_len_shape)
-            text_emb = torch.from_dlpack(res.to_dlpack()).to("cuda")
-        else:
-            text_emb = self.text_embedding(text_inputs) + self.text_pos_embedding(text_inputs)
         mel_codes, mel_targets = self.build_aligned_inputs_and_targets(mel_codes, self.start_mel_token, self.stop_mel_token)
         if raw_mels is not None:
             mel_inp = F.pad(raw_mels, (0, 8))
         else:
             mel_inp = mel_codes
-        mel_emb = self.mel_embedding(mel_inp)
-        mel_emb = mel_emb + self.mel_pos_embedding(mel_codes)
+
+        if 'USE_TVM_MODEL' in os.environ:
+            assert raw_mels is None
+            # ToDo: merge it with gpt2 call
+            i_text = nd.from_dlpack(text_inputs)
+            i_mel_codes = nd.array(mel_codes.cpu().numpy().astype(np.int32), self.inference_model.dev)
+            res = self.inference_model.vm[f"embeddings_calculate"](i_text, i_mel_codes)
+            text_emb = torch.from_dlpack(res[0].to_dlpack())
+            mel_emb = torch.from_dlpack(res[1].to_dlpack())
+            # validation code
+            # text_emb_ref = self.text_embedding(text_inputs.cpu()) + self.text_pos_embedding(text_inputs.cpu())
+            # mel_emb_ref = self.mel_embedding(mel_inp)
+            # mel_emb_ref = mel_emb_ref + self.mel_pos_embedding(mel_codes)
+            # diff_txt = text_emb_ref.cpu().numpy() - res[0].numpy()
+            # print("diff_txt", diff_txt)
+            # print("diff text_emb", np.linalg.norm(diff_txt))
+            # diff_mel = mel_emb_ref.cpu().numpy() - res[1].numpy()
+            # print("diff_mel", diff_mel)
+            # print("diff mel_emb", np.linalg.norm(diff_mel))
+            # print("diff mel_emb", mel_emb_ref.cpu().numpy())
+        else:
+            text_emb = self.text_embedding(text_inputs) + self.text_pos_embedding(text_inputs)
+            mel_emb = self.mel_embedding(mel_inp)
+            mel_emb = mel_emb + self.mel_pos_embedding(mel_codes)
 
         if text_first:
             text_logits, mel_logits = self.get_logits(conds, text_emb, self.text_head, mel_emb, self.mel_head, get_attns=return_attentions, return_latent=return_latent)
             if return_latent:
-                return mel_logits[:, :-2]  # Despite the name, these are not logits. Strip off the two tokens added by this forward pass.
+                res = mel_logits[:, :-2]  # Despite the name, these are not logits. Strip off the two tokens added by this forward pass.
+                return res
         else:
             mel_logits, text_logits = self.get_logits(conds, mel_emb, self.mel_head, text_emb, self.text_head, get_attns=return_attentions, return_latent=return_latent)
             if return_latent:
                 return text_logits[:, :-2]  # Despite the name, these are not logits. Strip off the two tokens added by this forward pass.
-
         if return_attentions:
             return mel_logits
         loss_text = F.cross_entropy(text_logits, text_targets.long())
