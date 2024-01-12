@@ -4,7 +4,7 @@ import os
 import torch
 import torchaudio
 import time
-from api import TextToSpeech, MODELS_DIR
+from api import TextToSpeech, MODELS_DIR, load_discrete_vocoder_diffuser
 from utils.audio import load_voices
 
 PROFILE=False
@@ -40,16 +40,26 @@ if __name__ == '__main__':
             voice_sel = [selected_voice]
         voice_samples, conditioning_latents = load_voices(voice_sel)
         backend = "PYTORCH"
+        diffuser = None
+        # print("args", args)
+        # print("args.preset", args.preset)
         if 'USE_TVM_MODEL'  in os.environ:
             backend = "TVM"
+            diffuser = load_discrete_vocoder_diffuser(desired_diffusion_steps=30,
+                                                      cond_free=False, cond_free_k=2.0)
+            auto_conditioning, diffusion_conditioning, auto_conds, _ = tts.get_conditioning_latents(voice_samples, return_mels=True)
+        # print("diffuser->", diffuser)
         start_tm = time.time()
         if PROFILE == False:
-            gen, dbg_state = tts.tts_with_preset(args.text, k=args.candidates, voice_samples=voice_samples, conditioning_latents=conditioning_latents,
-                                      preset=args.preset, use_deterministic_seed=args.seed, return_deterministic_state=True, cvvp_amount=args.cvvp_amount)
+            gen, dbg_state = tts.tts_with_preset(args.text, diffuser=diffuser, k=args.candidates, voice_samples=None,
+                                                 conditioning_latents=(auto_conditioning, diffusion_conditioning, auto_conds),
+                                      preset=args.preset, use_deterministic_seed=args.seed, return_deterministic_state=True,
+                                      cvvp_amount=args.cvvp_amount)
         else:
             from torch.profiler import profile, ProfilerActivity
-            with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], profile_memory=True, with_modules=False, with_stack=True) as prof:
-                gen, dbg_state = tts.tts_with_preset(args.text, k=args.candidates, voice_samples=voice_samples, conditioning_latents=conditioning_latents,
+            with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], profile_memory=False, with_modules=False, with_stack=True) as prof:
+                gen, dbg_state = tts.tts_with_preset(args.text, diffuser=diffuser, k=args.candidates, voice_samples=None,
+                                                     conditioning_latents=(auto_conditioning, diffusion_conditioning, auto_conds),
                                         preset=args.preset, use_deterministic_seed=args.seed, return_deterministic_state=True, cvvp_amount=args.cvvp_amount)
             os.makedirs("traces",exist_ok=True)
             export_traces = f'./traces/trace_neonjb_{backend}.json'

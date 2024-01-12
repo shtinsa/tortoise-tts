@@ -314,6 +314,7 @@ class TextToSpeech:
             diffusion_conds = []
             for sample in voice_samples:
                 # The diffuser operates at a sample rate of 24000 (except for the latent inputs)
+                sample = sample.to("cuda")
                 sample = torchaudio.functional.resample(sample, 22050, 24000)
                 sample = pad_or_truncate(sample, 102400)
                 if "USE_TVM_MODEL" in os.environ:
@@ -349,7 +350,7 @@ class TextToSpeech:
         with torch.no_grad():
             return self.rlg_auto(torch.tensor([0.0])), self.rlg_diffusion(torch.tensor([0.0]))
 
-    def tts_with_preset(self, text, preset='fast', **kwargs):
+    def tts_with_preset(self, text, preset='fast', diffuser=None, **kwargs):
         """
         Calls TTS with one of a set of preset generation parameters. Options:
             'ultra_fast': Produces speech at a speed which belies the name of this repo. (Not really, but it's definitely fastest).
@@ -370,9 +371,9 @@ class TextToSpeech:
         }
         settings.update(presets[preset])
         settings.update(kwargs) # allow overriding of preset settings with kwargs
-        return self.tts(text, **settings)
+        return self.tts(text, diffuser=diffuser, **settings)
 
-    def tts(self, text, voice_samples=None, conditioning_latents=None, k=1, verbose=True, use_deterministic_seed=None,
+    def tts(self, text, diffuser=None,voice_samples=None, conditioning_latents=None, k=1, verbose=True, use_deterministic_seed=None,
             return_deterministic_state=False,
             # autoregressive generation parameters follow
             num_autoregressive_samples=512, temperature=.8, length_penalty=1, repetition_penalty=2.0, top_p=.8, max_mel_tokens=500,
@@ -435,13 +436,16 @@ class TextToSpeech:
         if voice_samples is not None:
             auto_conditioning, diffusion_conditioning, auto_conds, _ = self.get_conditioning_latents(voice_samples, return_mels=True)
         elif conditioning_latents is not None:
-            auto_conditioning, diffusion_conditioning = conditioning_latents
+            auto_conditioning, diffusion_conditioning, auto_conds = conditioning_latents
         else:
             auto_conditioning, diffusion_conditioning = self.get_random_conditioning_latents()
         auto_conditioning = auto_conditioning.to(self.device)
         diffusion_conditioning = diffusion_conditioning.to(self.device)
-
-        diffuser = load_discrete_vocoder_diffuser(desired_diffusion_steps=diffusion_iterations, cond_free=cond_free, cond_free_k=cond_free_k)
+        if 'USE_TVM_MODEL'  in os.environ:
+            # print("diffuser", diffuser)
+            assert diffuser is not None
+        else:
+            diffuser = load_discrete_vocoder_diffuser(desired_diffusion_steps=diffusion_iterations, cond_free=cond_free, cond_free_k=cond_free_k)
 
         with torch.no_grad():
             samples = []
