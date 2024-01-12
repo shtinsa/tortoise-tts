@@ -1,6 +1,11 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import tvm
+from tvm import relax
+from tvm import nd
+import numpy as np
+import os
 
 MAX_WAV_VALUE = 32768.0
 
@@ -238,31 +243,43 @@ class UnivNetGenerator(nn.Module):
         self.hop_length = hop_length
         channel_size = channel_size
         kpnet_conv_size = kpnet_conv_size
-
-        self.res_stack = nn.ModuleList()
-        hop_length = 1
-        for stride in strides:
-            hop_length = stride * hop_length
-            self.res_stack.append(
-                LVCBlock(
-                    channel_size,
-                    n_mel_channels,
-                    stride=stride,
-                    dilations=dilations,
-                    lReLU_slope=lReLU_slope,
-                    cond_hop_length=hop_length,
-                    kpnet_conv_size=kpnet_conv_size
+        if 'USE_TVM_MODEL'  in os.environ:
+            models_path = os.environ['TVM_MODELS_DIR']
+            target = tvm.target.Target("nvidia/geforce-rtx-3070", host="llvm")
+            self.dev_ = tvm.device(target.kind.name, 0)
+            self.MAX_PAD = 12
+            self.CHUNK = 160
+            self.HOP_LENGTH = 256
+            self.GROUP_SIZE = (self.CHUNK + 2 * self.MAX_PAD)
+            lib = tvm.runtime.load_module(f'{models_path}/univnet.so')
+            self.vm_ = relax.VirtualMachine(lib, self.dev_)
+            self.buffer_ = np.zeros((1, 100, self.GROUP_SIZE), dtype=np.float16)
+            self.noise_buffer = np.zeros((1, 64, self.GROUP_SIZE), dtype=np.float16)
+        else:
+            self.res_stack = nn.ModuleList()
+            hop_length = 1
+            for stride in strides:
+                hop_length = stride * hop_length
+                self.res_stack.append(
+                    LVCBlock(
+                        channel_size,
+                        n_mel_channels,
+                        stride=stride,
+                        dilations=dilations,
+                        lReLU_slope=lReLU_slope,
+                        cond_hop_length=hop_length,
+                        kpnet_conv_size=kpnet_conv_size
+                    )
                 )
+
+            self.conv_pre = \
+                nn.utils.weight_norm(nn.Conv1d(noise_dim, channel_size, 7, padding=3, padding_mode='reflect'))
+
+            self.conv_post = nn.Sequential(
+                nn.LeakyReLU(lReLU_slope),
+                nn.utils.weight_norm(nn.Conv1d(channel_size, 1, 7, padding=3, padding_mode='reflect')),
+                nn.Tanh(),
             )
-
-        self.conv_pre = \
-            nn.utils.weight_norm(nn.Conv1d(noise_dim, channel_size, 7, padding=3, padding_mode='reflect'))
-
-        self.conv_post = nn.Sequential(
-            nn.LeakyReLU(lReLU_slope),
-            nn.utils.weight_norm(nn.Conv1d(channel_size, 1, 7, padding=3, padding_mode='reflect')),
-            nn.Tanh(),
-        )
 
     def forward(self, c, z):
         '''
@@ -296,6 +313,53 @@ class UnivNetGenerator(nn.Module):
 
         for res_block in self.res_stack:
             res_block.remove_weight_norm()
+            
+    def run_tvm(self, c, z):
+        x_t = c
+
+        print("!!!!!!!!!!!!!")
+
+        output_arr = np.zeros((1, self.HOP_LENGTH * x_t.shape[2]), dtype=np.float16)
+        left = 184#min(self.CHUNK + self.MAX_PAD, x_t.shape[1])
+        xx = x_t.to(torch.float16).cpu().numpy()
+        zz = z.to(torch.float16).cpu().numpy()
+        self.buffer_[0, :, 0:left] = xx[0, :, :left]
+        self.noise_buffer[0, :, 0:left] = zz[0, :, :left]
+
+        i_g = nd.array(self.noise_buffer, device=self.dev_)
+        i_x = nd.array(self.buffer_, device=self.dev_)
+        outs = []
+        # first iter
+        output_b = self.vm_["vocoder_184"](i_x, i_g)
+        
+        real_len = min(x_t.shape[2], self.CHUNK)
+        outs.append([output_b.numpy(), real_len * self.HOP_LENGTH, real_len])
+        for pos in range(self.CHUNK, x_t.shape[2], self.CHUNK):
+            left = min(self.MAX_PAD + x_t.shape[2] - pos, self.GROUP_SIZE)
+            self.buffer_[0, :, 0:left] = xx[0, :, pos - self.MAX_PAD: pos - self.MAX_PAD + left]
+            self.noise_buffer[0, :, 0:left] = zz[0, :, pos - self.MAX_PAD: pos - self.MAX_PAD + left]
+            if left < self.GROUP_SIZE:
+                self.buffer_[0, :, left:] = 0
+                self.noise_buffer[0, :, left:] = 0
+            i_x = nd.array(self.buffer_, device=self.dev_)
+            i_g = nd.array(self.noise_buffer, device=self.dev_)
+            output_b1 = self.vm_["vocoder_184"](i_x, i_g)
+            real_len = min(left - self.MAX_PAD, self.CHUNK)
+            new_len = (pos + real_len) * self.HOP_LENGTH
+            outs.append([output_b1.numpy(), new_len, real_len])
+        pos = self.CHUNK
+        b = outs[0][0]#.numpy()
+        real_len = outs[0][1]
+        output_arr[0, :real_len] = b[0, 0, :real_len]
+        for i in range(1, len(outs)):
+            val = outs[i]
+            b = val[0]#.numpy()
+            new_len = val[1]
+            real_len = val[2]
+            output_arr[0, pos*self.HOP_LENGTH:new_len] = b[0, 0, self.MAX_PAD * self.HOP_LENGTH:(real_len + self.MAX_PAD)*self.HOP_LENGTH]
+            pos += self.CHUNK
+        output_arr = torch.tensor(output_arr, dtype=torch.float32)
+        return output_arr
 
     def inference(self, c, z=None):
         # pad input mel with zeros to cut artifact
@@ -306,10 +370,16 @@ class UnivNetGenerator(nn.Module):
         if z is None:
             z = torch.randn(c.shape[0], self.noise_dim, mel.size(2)).to(mel.device)
 
-        audio = self.forward(mel, z)
-        audio = audio[:, :, :-(self.hop_length * 10)]
-        audio = audio.clamp(min=-1, max=1)
-        return audio
+        if 'USE_TVM_MODEL' in os.environ:
+            audio = self.run_tvm(mel, z)
+            audio = audio[:, :-(self.hop_length * 10)]
+            audio = audio.clamp(min=-1, max=1)
+        else:
+            audio = self.forward(mel, z)
+            audio = audio[:, :, :-(self.hop_length * 10)]
+            audio = audio.clamp(min=-1, max=1)      
+        
+        return torch.tensor(audio, dtype=torch.float32)
 
 
 if __name__ == '__main__':
