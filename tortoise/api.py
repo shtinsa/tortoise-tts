@@ -163,14 +163,16 @@ def pick_best_batch_size_for_gpu():
     if torch.cuda.is_available():
         _, available = torch.cuda.mem_get_info()
         availableGb = available / (1024 ** 3)
+        scale = 1
+        if 'USE_TVM_MODEL'  in os.environ:
+            scale = 4
         if availableGb > 14:
-            return 16
+            return 16 * scale
         elif availableGb > 10:
-            return 8
+            return 8 * scale
         elif availableGb > 7:
-            if 'USE_TVM_MODEL'  in os.environ:
-                return 16
-            return 4
+            return 4 * scale
+
     if torch.backends.mps.is_available():
         import psutil
         available = psutil.virtual_memory().total
@@ -374,7 +376,7 @@ class TextToSpeech:
         # Presets are defined here.
         presets = {
             'ultra_fast': {'num_autoregressive_samples': 16, 'diffusion_iterations': 30, 'cond_free': False},
-            'fast': {'num_autoregressive_samples': 96, 'diffusion_iterations': 80},
+            'fast': {'num_autoregressive_samples': 128, 'diffusion_iterations': 80},
             'standard': {'num_autoregressive_samples': 256, 'diffusion_iterations': 200},
             'high_quality': {'num_autoregressive_samples': 256, 'diffusion_iterations': 400},
         }
