@@ -168,6 +168,8 @@ def pick_best_batch_size_for_gpu():
         elif availableGb > 10:
             return 8
         elif availableGb > 7:
+            if 'USE_TVM_MODEL'  in os.environ:
+                return 16
             return 4
     if torch.backends.mps.is_available():
         import psutil
