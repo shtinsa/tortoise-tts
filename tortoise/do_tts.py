@@ -4,7 +4,7 @@ import os
 import torch
 import torchaudio
 import time
-from api import TextToSpeech, MODELS_DIR, load_discrete_vocoder_diffuser
+from api import TextToSpeech, MODELS_DIR, load_discrete_vocoder_diffuser, PRESETS, COND_FREE_K
 from utils.audio import load_voices
 
 PROFILE=False
@@ -45,8 +45,12 @@ if __name__ == '__main__':
         # print("args.preset", args.preset)
         if 'USE_TVM_MODEL'  in os.environ:
             backend = "TVM"
-            diffuser = load_discrete_vocoder_diffuser(desired_diffusion_steps=30,
-                                                      cond_free=False, cond_free_k=2.0)
+            preset = PRESETS[args.preset]
+            cond_free = True
+            if "cond_free" in preset.keys():
+                cond_free = preset['cond_free']
+            diffuser = load_discrete_vocoder_diffuser(desired_diffusion_steps=preset['diffusion_iterations'],
+                                                      cond_free=cond_free, cond_free_k=COND_FREE_K)
             auto_conditioning, diffusion_conditioning, auto_conds, _ = tts.get_conditioning_latents(voice_samples, return_mels=True)
             del conditioning_latents
             conditioning_latents = (auto_conditioning, diffusion_conditioning, auto_conds)

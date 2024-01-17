@@ -43,6 +43,15 @@ MODELS = {
     'rlg_diffuser.pth': 'https://huggingface.co/jbetker/tortoise-tts-v2/resolve/main/.models/rlg_diffuser.pth',
 }
 
+PRESETS = {
+    'ultra_fast': {'num_autoregressive_samples': 64, 'diffusion_iterations': 30, 'cond_free': False},
+    'fast': {'num_autoregressive_samples': 128, 'diffusion_iterations': 80},
+    'standard': {'num_autoregressive_samples': 256, 'diffusion_iterations': 200},
+    'high_quality': {'num_autoregressive_samples': 256, 'diffusion_iterations': 400},
+}
+
+COND_FREE_K = 2.0
+
 def get_model_path(model_name, models_dir=MODELS_DIR):
     """
     Get path to given model, download it if it doesn't exist.
@@ -372,15 +381,9 @@ class TextToSpeech:
         # Use generally found best tuning knobs for generation.
         settings = {'temperature': .8, 'length_penalty': 1.0, 'repetition_penalty': 2.0,
                     'top_p': .8,
-                    'cond_free_k': 2.0, 'diffusion_temperature': 1.0}
+                    'cond_free_k': COND_FREE_K, 'diffusion_temperature': 1.0}
         # Presets are defined here.
-        presets = {
-            'ultra_fast': {'num_autoregressive_samples': 16, 'diffusion_iterations': 30, 'cond_free': False},
-            'fast': {'num_autoregressive_samples': 128, 'diffusion_iterations': 80},
-            'standard': {'num_autoregressive_samples': 256, 'diffusion_iterations': 200},
-            'high_quality': {'num_autoregressive_samples': 256, 'diffusion_iterations': 400},
-        }
-        settings.update(presets[preset])
+        settings.update(PRESETS[preset])
         settings.update(kwargs) # allow overriding of preset settings with kwargs
         return self.tts(text, diffuser=diffuser, **settings)
 
