@@ -14,7 +14,12 @@ import numpy as np
 import torch
 import torch as th
 from tqdm import tqdm
+import os
 
+# import tvm
+from tvm import relax, runtime, nd
+from tvm import target as target_tvm
+from tvm import device as device_tvm
 
 def normal_kl(mean1, logvar1, mean2, logvar2):
     """
@@ -337,19 +342,27 @@ class GaussianDiffusion:
 
         B, C = x.shape[:2]
         assert t.shape == (B,)
+        # print()
+        # np.save("/home/sshtin/Dev/tortoise-tvm/test_data/x_p_mean_variance.npy", x.cpu().numpy())
+        # np.save("/home/sshtin/Dev/tortoise-tvm/test_data/precomputed_aligned_embeddings_p_mean_variance.npy", model_kwargs['precomputed_aligned_embeddings'].cpu().numpy())
+        # print(model_kwargs.keys())
         model_output = model(x, self._scale_timesteps(t), **model_kwargs)
         if self.conditioning_free:
             model_output_no_conditioning = model(x, self._scale_timesteps(t), conditioning_free=True, **model_kwargs)
-
+        # print("self.model_var_type", self.model_var_type)
         if self.model_var_type in [ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
             assert model_output.shape == (B, C * 2, *x.shape[2:])
             model_output, model_var_values = th.split(model_output, C, dim=1)
+            # np.save("/home/sshtin/Dev/tortoise-tvm/test_data/model_output_split_p_mean_variance.npy", model_output.cpu().numpy())
+            # print("s 1")
             if self.conditioning_free:
                 model_output_no_conditioning, _ = th.split(model_output_no_conditioning, C, dim=1)
             if self.model_var_type == ModelVarType.LEARNED:
+                # print("s 1.1")
                 model_log_variance = model_var_values
                 model_variance = th.exp(model_log_variance)
             else:
+                # print("s 1.x")
                 min_log = _extract_into_tensor(
                     self.posterior_log_variance_clipped, t, x.shape
                 )
@@ -373,8 +386,9 @@ class GaussianDiffusion:
             }[self.model_var_type]
             model_variance = _extract_into_tensor(model_variance, t, x.shape)
             model_log_variance = _extract_into_tensor(model_log_variance, t, x.shape)
-
+        # print("s 2"," self.conditioning_free", self.conditioning_free)
         if self.conditioning_free:
+            # print("s 2.1")
             if self.ramp_conditioning_free:
                 assert t.shape[0] == 1  # This should only be used in inference.
                 cfk = self.conditioning_free_k * (1 - self._scale_timesteps(t)[0].item() / self.num_timesteps)
@@ -388,19 +402,32 @@ class GaussianDiffusion:
             if clip_denoised:
                 return x.clamp(-1, 1)
             return x
-
+        # print("s 3"," self.model_mean_type", self.model_mean_type)
         if self.model_mean_type == ModelMeanType.PREVIOUS_X:
+            # print("s 4")
             pred_xstart = process_xstart(
                 self._predict_xstart_from_xprev(x_t=x, t=t, xprev=model_output)
             )
             model_mean = model_output
         elif self.model_mean_type in [ModelMeanType.START_X, ModelMeanType.EPSILON]:
+            # print("s 5")
             if self.model_mean_type == ModelMeanType.START_X:
                 pred_xstart = process_xstart(model_output)
             else:
+                # print("s 6, denoised_fn", denoised_fn)
+                zzz = self._predict_xstart_from_eps(x_t=x, t=t, eps=model_output)
+                t1 = _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x.shape) * x
+                # np.save("/home/sshtin/Dev/tortoise-tvm/test_data/t1_p_mean_variance.npy", t1.cpu().numpy())
+                # np.save("/home/sshtin/Dev/tortoise-tvm/test_data/predict_xstart_from_eps_p_mean_variance.npy", zzz.cpu().numpy())
+                z1 = _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x.shape)
+                # np.save("/home/sshtin/Dev/tortoise-tvm/test_data/beta_p_mean_variance.npy", z1.cpu().numpy())
+                z2 = z1 * model_output
+                # np.save("/home/sshtin/Dev/tortoise-tvm/test_data/z2_p_mean_variance.npy", z2.cpu().numpy())
                 pred_xstart = process_xstart(
                     self._predict_xstart_from_eps(x_t=x, t=t, eps=model_output)
                 )
+            # print("s 7")
+            # np.save("/home/sshtin/Dev/tortoise-tvm/test_data/pred_xstart_p_mean_variance.npy", pred_xstart.cpu().numpy())
             model_mean, _, _ = self.q_posterior_mean_variance(
                 x_start=pred_xstart, x_t=x, t=t
             )
@@ -410,6 +437,9 @@ class GaussianDiffusion:
         assert (
             model_mean.shape == model_log_variance.shape == pred_xstart.shape == x.shape
         )
+        # np.save("/home/sshtin/Dev/tortoise-tvm/test_data/model_mean_p_mean_variance.npy", model_mean.cpu().numpy())
+        # np.save("/home/sshtin/Dev/tortoise-tvm/test_data/model_log_variance_p_mean_variance.npy", model_log_variance.cpu().numpy())
+
         return {
             "mean": model_mean,
             "variance": model_variance,
@@ -419,6 +449,12 @@ class GaussianDiffusion:
 
     def _predict_xstart_from_eps(self, x_t, t, eps):
         assert x_t.shape == eps.shape
+        # print("x_t", x_t)
+        # print("t", t)
+        # print("self.sqrt_recip_alphas_cumprod", self.sqrt_recip_alphas_cumprod)
+        # print("self.sqrt_recip_alphas_cumprod", self.sqrt_recip_alphas_cumprod.shape)
+        # print("self.sqrt_recipm1_alphas_cumprod", self.sqrt_recipm1_alphas_cumprod)
+        # print("self.sqrt_recipm1_alphas_cumprod", self.sqrt_recipm1_alphas_cumprod.shape)
         return (
             _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
             - _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * eps
@@ -511,14 +547,34 @@ class GaussianDiffusion:
                  - 'sample': a random sample from the model.
                  - 'pred_xstart': a prediction of x_0.
         """
-        out = self.p_mean_variance(
-            model,
-            x,
-            t,
-            clip_denoised=clip_denoised,
-            denoised_fn=denoised_fn,
-            model_kwargs=model_kwargs,
-        )
+        if 'USE_TVM_MODEL11' in os.environ.keys():
+            assert self.conditioning_free == False
+            precomp = model_kwargs['precomputed_aligned_embeddings'].cpu().numpy()
+
+            x_tr = np.transpose(x.cpu().numpy().astype("float16"), (0, 2, 1))
+            i_x_tr = nd.array(x_tr, self.dev_)
+
+            precomp_aligned = np.zeros((1, x_tr.shape[1], precomp.shape[1])).astype("float16")
+            precomp_aligned[:, 0:x_tr.shape[1], :] = np.transpose(precomp, (0, 2, 1))
+
+            i_precomp_aligned_embed_tr = nd.array(precomp_aligned, self.dev_)
+            t_val = np.array([t.cpu().numpy()[0]], dtype=np.int32)
+            # print(t_val)
+            i_t = nd.array(t_val, self.dev_)
+            res = self.diffusion_decoder['p_mean_variance_transp_30'](i_x_tr, i_t, i_precomp_aligned_embed_tr)
+            out = {
+                "mean" : th.Tensor(np.transpose(res[0].numpy(), (0, 2, 1))).to("cuda"),
+                "log_variance" : th.Tensor(np.transpose(res[1].numpy(), (0, 2, 1))).to("cuda"),
+            }
+        else:
+            out = self.p_mean_variance(
+                model,
+                x,
+                t,
+                clip_denoised=clip_denoised,
+                denoised_fn=denoised_fn,
+                model_kwargs=model_kwargs,
+            )
         noise = th.randn_like(x)
         nonzero_mask = (
             (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
@@ -527,8 +583,12 @@ class GaussianDiffusion:
             out["mean"] = self.condition_mean(
                 cond_fn, out, x, t, model_kwargs=model_kwargs
             )
+        # print("nonzero_mask", nonzero_mask)
+        # print("noise", noise)
+        # print("out[log_variance]", out["log_variance"])
         sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise
-        return {"sample": sample, "pred_xstart": out["pred_xstart"]}
+        # exit(0)
+        return {"sample": sample, "pred_xstart": None}
 
     def p_sample_loop(
         self,
@@ -604,7 +664,8 @@ class GaussianDiffusion:
         else:
             img = th.randn(*shape, device=device)
         indices = list(range(self.num_timesteps))[::-1]
-
+        # print("indices", indices)
+        # exit(0)
         for i in tqdm(indices, disable=not progress):
             t = th.tensor([i] * shape[0], device=device)
             with th.no_grad():
@@ -1103,6 +1164,22 @@ class SpacedDiffusion(GaussianDiffusion):
         self.use_timesteps = set(use_timesteps)
         self.timestep_map = []
         self.original_num_steps = len(kwargs["betas"])
+        if 'USE_TVM_MODEL11' in os.environ.keys():
+            self.target = target_tvm.Target("nvidia/geforce-rtx-3070", host="llvm")
+            self.dev_ = device_tvm(self.target.kind.name, 0)
+
+            models_path = os.environ['TVM_MODELS_DIR']
+            # self.lib_name = 'test_diffusion.so'
+            # self.index = 256
+            # self.lib_name = f'test_diffusion_tr_{self.index}.so'
+
+            self.lib_name = 'diffusion_dyn.so'
+            print(f'-------{self.lib_name}--------')
+            lib = runtime.load_module(f'{models_path}/{self.lib_name}')
+            print(f'-------{self.lib_name} end--------')
+            # lib = tvm.runtime.load_module(f'{models_path}/test_diffusion.so')
+            self.diffusion_decoder = relax.VirtualMachine(lib, self.dev_)
+            print("load lib, self.diffusion_decoder = ", self.diffusion_decoder)
 
         base_diffusion = GaussianDiffusion(**kwargs)  # pylint: disable=missing-kwoa
         last_alpha_cumprod = 1.0
