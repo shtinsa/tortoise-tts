@@ -27,6 +27,7 @@ from huggingface_hub import hf_hub_download
 import tvm
 from tvm import relax
 from tvm import nd
+import numpy as np
 
 pbar = None
 
@@ -139,13 +140,24 @@ def do_spectrogram_diffusion(diffusion_model, diffuser, latents, conditioning_la
     """
     with torch.no_grad():
         output_seq_len = latents.shape[1] * 4 * 24000 // 22050  # This diffusion model converts from 22kHz spectrogram codes to a 24kHz spectrogram signal.
-        output_shape = (latents.shape[0], 100, output_seq_len)
-        precomputed_embeddings = diffusion_model.timestep_independent(latents, conditioning_latents, output_seq_len, False)
 
-        noise = torch.randn(output_shape, device=latents.device) * temperature
+        if 'USE_TVM_MODEL' in os.environ.keys():
+            i_latents = tvm.nd.array(latents.cpu().numpy().astype("float16"), diffuser.dev_)
+            i_conditioning_latents = tvm.nd.array(conditioning_latents.cpu().numpy().astype("float16"), diffuser.dev_)
+            exp_len_shape = tvm.runtime.ShapeTuple([output_seq_len])
+            output_shape = (latents.shape[0], output_seq_len, 100)
+            precomputed_embeddings = diffuser.diffusion_decoder["timestep_independent"](i_latents, i_conditioning_latents, exp_len_shape)
+            noise = nd.from_dlpack(torch.randn(output_shape, dtype=torch.float16, device="cuda") * temperature)
+        else:
+            output_shape = (latents.shape[0], 100, output_seq_len)
+            precomputed_embeddings = diffusion_model.timestep_independent(latents, conditioning_latents, output_seq_len, False)
+            noise = torch.randn(output_shape, device=latents.device) * temperature
         mel = diffuser.p_sample_loop(diffusion_model, output_shape, noise=noise,
                                       model_kwargs={'precomputed_aligned_embeddings': precomputed_embeddings},
                                      progress=verbose)
+        if 'USE_TVM_MODEL' in os.environ.keys():
+            mel = torch.Tensor(np.transpose(mel.numpy().astype("float32"), (0, 2, 1))).to("cuda")
+
         return denormalize_tacotron_mel(mel)[:,:,:output_seq_len]
 
 
@@ -283,7 +295,7 @@ class TextToSpeech:
         self.rlg_diffusion = None
 
         # from tortoise-tts-fast
-        self.diffusion = self.diffusion.to("cuda")
+        # self.diffusion = self.diffusion.to("cuda")
         self.vocoder = self.vocoder.to("cuda")
 
     @contextmanager
@@ -456,11 +468,12 @@ class TextToSpeech:
             auto_conditioning, diffusion_conditioning = self.get_random_conditioning_latents()
         auto_conditioning = auto_conditioning.to(self.device)
         diffusion_conditioning = diffusion_conditioning.to(self.device)
-        print(time.time() - st_time)
+
         if 'USE_TVM_MODEL'  in os.environ:
             assert diffuser is not None
         else:
             diffuser = load_discrete_vocoder_diffuser(desired_diffusion_steps=diffusion_iterations, cond_free=cond_free, cond_free_k=cond_free_k)
+        print("preprocessing ", time.time() - st_time)
 
         with torch.no_grad():
             samples = []

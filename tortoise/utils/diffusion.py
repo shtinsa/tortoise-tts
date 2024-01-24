@@ -547,34 +547,26 @@ class GaussianDiffusion:
                  - 'sample': a random sample from the model.
                  - 'pred_xstart': a prediction of x_0.
         """
-        if 'USE_TVM_MODEL11' in os.environ.keys():
+        # print('precomputed_aligned_embeddings', model_kwargs['precomputed_aligned_embeddings'].shape)
+        if 'USE_TVM_MODEL' in os.environ.keys():
             assert self.conditioning_free == False
-            precomp = model_kwargs['precomputed_aligned_embeddings'].cpu().numpy()
-
-            x_tr = np.transpose(x.cpu().numpy().astype("float16"), (0, 2, 1))
-            i_x_tr = nd.array(x_tr, self.dev_)
-
-            precomp_aligned = np.zeros((1, x_tr.shape[1], precomp.shape[1])).astype("float16")
-            precomp_aligned[:, 0:x_tr.shape[1], :] = np.transpose(precomp, (0, 2, 1))
-
-            i_precomp_aligned_embed_tr = nd.array(precomp_aligned, self.dev_)
-            t_val = np.array([t.cpu().numpy()[0]], dtype=np.int32)
-            # print(t_val)
+            precomp = model_kwargs['precomputed_aligned_embeddings']
+            t_val = np.array([t], dtype=np.int32)
             i_t = nd.array(t_val, self.dev_)
-            res = self.diffusion_decoder['p_mean_variance_transp_30'](i_x_tr, i_t, i_precomp_aligned_embed_tr)
-            out = {
-                "mean" : th.Tensor(np.transpose(res[0].numpy(), (0, 2, 1))).to("cuda"),
-                "log_variance" : th.Tensor(np.transpose(res[1].numpy(), (0, 2, 1))).to("cuda"),
-            }
-        else:
-            out = self.p_mean_variance(
-                model,
-                x,
-                t,
-                clip_denoised=clip_denoised,
-                denoised_fn=denoised_fn,
-                model_kwargs=model_kwargs,
-            )
+            if t == 0:
+                noise = nd.from_dlpack(torch.zeros(x.shape, dtype=torch.float16, device="cuda"))
+            else:
+                noise = nd.from_dlpack(torch.randn(x.shape, dtype=torch.float16, device="cuda"))
+            res = self.diffusion_decoder['p_mean_variance_transp_30'](x, i_t, precomp, noise)
+            return {"sample": res, "pred_xstart": None}
+        out = self.p_mean_variance(
+            model,
+            x,
+            t,
+            clip_denoised=clip_denoised,
+            denoised_fn=denoised_fn,
+            model_kwargs=model_kwargs,
+        )
         noise = th.randn_like(x)
         nonzero_mask = (
             (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
@@ -583,11 +575,7 @@ class GaussianDiffusion:
             out["mean"] = self.condition_mean(
                 cond_fn, out, x, t, model_kwargs=model_kwargs
             )
-        # print("nonzero_mask", nonzero_mask)
-        # print("noise", noise)
-        # print("out[log_variance]", out["log_variance"])
         sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise
-        # exit(0)
         return {"sample": sample, "pred_xstart": None}
 
     def p_sample_loop(
@@ -667,7 +655,10 @@ class GaussianDiffusion:
         # print("indices", indices)
         # exit(0)
         for i in tqdm(indices, disable=not progress):
-            t = th.tensor([i] * shape[0], device=device)
+            if 'USE_TVM_MODEL' in os.environ.keys():
+                t = i
+            else:
+                t = th.tensor([i] * shape[0], device=device)
             with th.no_grad():
                 out = self.p_sample(
                     model,
@@ -1164,7 +1155,7 @@ class SpacedDiffusion(GaussianDiffusion):
         self.use_timesteps = set(use_timesteps)
         self.timestep_map = []
         self.original_num_steps = len(kwargs["betas"])
-        if 'USE_TVM_MODEL11' in os.environ.keys():
+        if 'USE_TVM_MODEL' in os.environ.keys():
             self.target = target_tvm.Target("nvidia/geforce-rtx-3070", host="llvm")
             self.dev_ = device_tvm(self.target.kind.name, 0)
 
