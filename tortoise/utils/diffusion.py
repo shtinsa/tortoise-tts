@@ -347,6 +347,8 @@ class GaussianDiffusion:
         # np.save("/home/sshtin/Dev/tortoise-tvm/test_data/precomputed_aligned_embeddings_p_mean_variance.npy", model_kwargs['precomputed_aligned_embeddings'].cpu().numpy())
         # print(model_kwargs.keys())
         model_output = model(x, self._scale_timesteps(t), **model_kwargs)
+        # print("self.conditioning_free", self.conditioning_free)
+        # exit(0)
         if self.conditioning_free:
             model_output_no_conditioning = model(x, self._scale_timesteps(t), conditioning_free=True, **model_kwargs)
         # print("self.model_var_type", self.model_var_type)
@@ -547,9 +549,8 @@ class GaussianDiffusion:
                  - 'sample': a random sample from the model.
                  - 'pred_xstart': a prediction of x_0.
         """
-        # print('precomputed_aligned_embeddings', model_kwargs['precomputed_aligned_embeddings'].shape)
+
         if 'USE_TVM_MODEL' in os.environ.keys():
-            assert self.conditioning_free == False
             precomp = model_kwargs['precomputed_aligned_embeddings']
             t_val = np.array([t], dtype=np.int32)
             i_t = nd.array(t_val, self.dev_)
@@ -557,8 +558,9 @@ class GaussianDiffusion:
                 noise = nd.from_dlpack(torch.zeros(x.shape, dtype=torch.float16, device="cuda"))
             else:
                 noise = nd.from_dlpack(torch.randn(x.shape, dtype=torch.float16, device="cuda"))
-            res = self.diffusion_decoder['p_mean_variance_transp_30'](x, i_t, precomp, noise)
+            res = self.diffusion_decoder[self.callback](x, i_t, precomp, noise)
             return {"sample": res, "pred_xstart": None}
+
         out = self.p_mean_variance(
             model,
             x,
@@ -1156,21 +1158,20 @@ class SpacedDiffusion(GaussianDiffusion):
         self.timestep_map = []
         self.original_num_steps = len(kwargs["betas"])
         if 'USE_TVM_MODEL' in os.environ.keys():
+            iterations = len(self.use_timesteps)
+            self.callback = ''
+            assert iterations in [30, 80, 200, 400] # see default preset
+            if kwargs['conditioning_free'] == False:
+                assert iterations == 30
+                self.callback = f'p_mean_variance_transp_{iterations}'
+            else:
+                self.callback = f'p_mean_variance__cond_free_transp_{iterations}'
             self.target = target_tvm.Target("nvidia/geforce-rtx-3070", host="llvm")
             self.dev_ = device_tvm(self.target.kind.name, 0)
-
             models_path = os.environ['TVM_MODELS_DIR']
-            # self.lib_name = 'test_diffusion.so'
-            # self.index = 256
-            # self.lib_name = f'test_diffusion_tr_{self.index}.so'
-
             self.lib_name = 'diffusion_dyn.so'
-            print(f'-------{self.lib_name}--------')
             lib = runtime.load_module(f'{models_path}/{self.lib_name}')
-            print(f'-------{self.lib_name} end--------')
-            # lib = tvm.runtime.load_module(f'{models_path}/test_diffusion.so')
             self.diffusion_decoder = relax.VirtualMachine(lib, self.dev_)
-            print("load lib, self.diffusion_decoder = ", self.diffusion_decoder)
 
         base_diffusion = GaussianDiffusion(**kwargs)  # pylint: disable=missing-kwoa
         last_alpha_cumprod = 1.0
