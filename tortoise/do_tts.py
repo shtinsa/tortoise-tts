@@ -6,6 +6,7 @@ import torchaudio
 import time
 from api import TextToSpeech, MODELS_DIR, load_discrete_vocoder_diffuser, PRESETS, COND_FREE_K
 from utils.audio import load_voices
+import librosa
 
 PROFILE=False
 
@@ -78,12 +79,16 @@ if __name__ == '__main__':
             with open(export_logs, 'w') as fle:
                 fle.write("{}".format(prof.key_averages(group_by_stack_n=5).table(sort_by="self_cuda_time_total")))
 
-        print(f"{backend} Infer time:", time.time() - start_tm, ' sec.')
+        backend_time = time.time() - start_tm
+        print(f"{backend} Infer time:", backend_time, ' sec.')
         if isinstance(gen, list):
             for j, g in enumerate(gen):
                 torchaudio.save(os.path.join(args.output_path, f'{selected_voice}_{k}_{j}.wav'), g.squeeze(0).cpu(), 24000)
         else:
-            torchaudio.save(os.path.join(args.output_path, f'{selected_voice}_{k}.wav'), gen.squeeze(0).cpu(), 24000)
+            wav_name = os.path.join(args.output_path, f'{selected_voice}_{k}.wav')
+            torchaudio.save(wav_name, gen.squeeze(0).cpu(), 24000)
+            dur = librosa.get_duration(filename=wav_name)
+            print(f"{backend} RTF:", backend_time / dur, ' .')
 
         if args.produce_debug_state:
             os.makedirs('debug_states', exist_ok=True)
