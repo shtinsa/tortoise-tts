@@ -61,10 +61,29 @@ if __name__ == '__main__':
         # print("diffuser->", diffuser)
         start_tm = time.time()
         if PROFILE == False:
-            gen, dbg_state = tts.tts_with_preset(args.text, diffuser=diffuser, k=args.candidates, voice_samples=voice_samples,
-                                                 conditioning_latents=conditioning_latents,
-                                      preset=args.preset, use_deterministic_seed=args.seed, return_deterministic_state=True,
-                                      cvvp_amount=args.cvvp_amount)
+            TESTS_NUM = 5
+            rtfs = 0
+            times = 0
+            for i in range(TESTS_NUM):
+                start_tm = time.time()
+                gen, _ = tts.tts_with_preset(args.text, diffuser=diffuser, k=args.candidates, voice_samples=voice_samples,
+                                                    conditioning_latents=conditioning_latents,
+                                        preset=args.preset, use_deterministic_seed=args.seed, return_deterministic_state=True,
+                                        cvvp_amount=args.cvvp_amount)
+                backend_time = time.time() - start_tm
+
+                times += backend_time
+                wav_name = os.path.join(args.output_path, f'{selected_voice}_{i}_{args.preset}.wav')
+                torchaudio.save(wav_name, gen.squeeze(0).cpu(), 24000)
+                dur = librosa.get_duration(filename=wav_name)
+                print(f"{backend} Infer time:", backend_time, f' sec. Frame dur: {dur} sec.')
+                rtf = backend_time / dur
+                rtfs += rtf
+                print(f"{backend} RTF:", rtf, ' .')
+                del gen
+            print("----------")
+            print(f"AVG {backend} time:", times/TESTS_NUM, ' .')
+            print(f"AVG RTF:", rtfs/TESTS_NUM, ' .')
         else:
             from torch.profiler import profile, ProfilerActivity
             with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], profile_memory=False, with_modules=False, with_stack=True) as prof:
@@ -79,18 +98,18 @@ if __name__ == '__main__':
             with open(export_logs, 'w') as fle:
                 fle.write("{}".format(prof.key_averages(group_by_stack_n=5).table(sort_by="self_cuda_time_total")))
 
-        backend_time = time.time() - start_tm
-        print(f"{backend} Infer time:", backend_time, ' sec.')
-        if isinstance(gen, list):
-            for j, g in enumerate(gen):
-                torchaudio.save(os.path.join(args.output_path, f'{selected_voice}_{k}_{j}.wav'), g.squeeze(0).cpu(), 24000)
-        else:
-            wav_name = os.path.join(args.output_path, f'{selected_voice}_{k}.wav')
-            torchaudio.save(wav_name, gen.squeeze(0).cpu(), 24000)
-            dur = librosa.get_duration(filename=wav_name)
-            print(f"{backend} RTF:", backend_time / dur, ' .')
+            backend_time = time.time() - start_tm
+            print(f"{backend} Infer time:", backend_time, ' sec.')
+            if isinstance(gen, list):
+                for j, g in enumerate(gen):
+                    torchaudio.save(os.path.join(args.output_path, f'{selected_voice}_{k}_{j}.wav'), g.squeeze(0).cpu(), 24000)
+            else:
+                wav_name = os.path.join(args.output_path, f'{selected_voice}_{k}.wav')
+                torchaudio.save(wav_name, gen.squeeze(0).cpu(), 24000)
+                dur = librosa.get_duration(filename=wav_name)
+                print(f"{backend} RTF:", backend_time / dur, ' .')
 
-        if args.produce_debug_state:
-            os.makedirs('debug_states', exist_ok=True)
-            torch.save(dbg_state, f'debug_states/do_tts_debug_{selected_voice}.pth')
+        # if args.produce_debug_state:
+        #     os.makedirs('debug_states', exist_ok=True)
+        #     torch.save(dbg_state, f'debug_states/do_tts_debug_{selected_voice}.pth')
 

@@ -156,6 +156,8 @@ def do_spectrogram_diffusion(diffusion_model, diffuser, latents, conditioning_la
                                       model_kwargs={'precomputed_aligned_embeddings': precomputed_embeddings},
                                      progress=verbose)
         if 'USE_TVM_MODEL' in os.environ.keys():
+            del noise
+            del precomputed_embeddings
             mel = torch.Tensor(np.transpose(mel.numpy().astype("float32"), (0, 2, 1))).to("cuda")
 
         return denormalize_tacotron_mel(mel)[:,:,:output_seq_len]
@@ -205,8 +207,10 @@ def pick_best_batch_size_for_gpu():
         elif availableGb > 7:
             return 4
     return 1
+
 target = tvm.target.Target("nvidia/geforce-rtx-3070", host="llvm")
 dev_ = tvm.device(target.kind.name, 0)
+
 class TextToSpeech:
     """
     Main entry point into Tortoise.
@@ -238,7 +242,7 @@ class TextToSpeech:
 
         self.tokenizer = VoiceBpeTokenizer(
             vocab_file=tokenizer_vocab_file,
-            use_basic_cleaners=tokenizer_basic,
+            # use_basic_cleaners=tokenizer_basic,
         )
         self.half = half
         if os.path.exists(f'{models_dir}/autoregressive.ptt'):
@@ -249,13 +253,13 @@ class TextToSpeech:
             if "USE_TVM_MODEL" in os.environ:
                 models_path = os.environ['TVM_MODELS_DIR']
                 lib = tvm.runtime.load_module(f'{models_path}/autoregressive_cond.so')
-                self.autoregressive_cond = relax.VirtualMachine(lib, dev_)
+                self.autoregressive_cond = relax.VirtualMachine(lib, dev_, memory_cfg={dev_:relax.VirtualMachine.LRUCACHE_ALLOCATOR})
                 lib = tvm.runtime.load_module(f'{models_path}/diffusion_cond.so')
-                self.diffusion_cond = relax.VirtualMachine(lib, dev_)
+                self.diffusion_cond = relax.VirtualMachine(lib, dev_, memory_cfg={dev_:relax.VirtualMachine.LRUCACHE_ALLOCATOR})
                 lib = tvm.runtime.load_module(f'{models_path}/wav2mel.so')
-                self.wav2mel = relax.VirtualMachine(lib, dev_)
+                self.wav2mel = relax.VirtualMachine(lib, dev_, memory_cfg={dev_:relax.VirtualMachine.LRUCACHE_ALLOCATOR})
                 lib = tvm.runtime.load_module(f'{models_path}/format_cond.so')
-                self.format_conditional = relax.VirtualMachine(lib, dev_)
+                self.format_conditional = relax.VirtualMachine(lib, dev_, memory_cfg={dev_:relax.VirtualMachine.LRUCACHE_ALLOCATOR})
             else:
                 self.format_conditional = None
 
@@ -289,6 +293,7 @@ class TextToSpeech:
         if "USE_TVM_MODEL" not in os.environ:
             self.vocoder.load_state_dict(torch.load(get_model_path('vocoder.pth', models_dir), map_location=torch.device('cpu'))['model_g'])
             self.vocoder.eval(inference=True)
+            self.vocoder = self.vocoder.to("cuda")
 
         # Random latent generators (RLGs) are loaded lazily.
         self.rlg_auto = None
@@ -296,7 +301,7 @@ class TextToSpeech:
 
         # from tortoise-tts-fast
         # self.diffusion = self.diffusion.to("cuda")
-        self.vocoder = self.vocoder.to("cuda")
+        # self.vocoder = self.vocoder.to("cuda")
 
     @contextmanager
     def temporary_cuda(self, model):

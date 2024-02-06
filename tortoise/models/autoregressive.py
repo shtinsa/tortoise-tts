@@ -58,7 +58,7 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
             libname = os.path.join(models_path, 'autoregressive.so')
             print("TVM:", libname) #debug message
             lib = runtime.load_module(libname)
-            self.vm = relax.VirtualMachine(lib, self.dev)
+            self.vm = relax.VirtualMachine(lib, self.dev, memory_cfg={self.dev:relax.VirtualMachine.LRUCACHE_ALLOCATOR})
             self.kv_caches = None
             self.shape = 0
             self.offset = 2

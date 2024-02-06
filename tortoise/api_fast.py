@@ -133,6 +133,7 @@ def do_spectrogram_diffusion(diffusion_model, diffuser, latents, conditioning_la
         output_shape = (latents.shape[0], 100, output_seq_len)
         precomputed_embeddings = diffusion_model.timestep_independent(latents, conditioning_latents, output_seq_len, False)
 
+
         noise = torch.randn(output_shape, device=latents.device) * temperature
         mel = diffuser.p_sample_loop(diffusion_model, output_shape, noise=noise,
                                       model_kwargs={'precomputed_aligned_embeddings': precomputed_embeddings},
@@ -234,7 +235,8 @@ class TextToSpeech:
             lib = tvm.runtime.load_module(f'{models_path}/autoregressive_cond.so')
             self.autoregressive_cond = relax.VirtualMachine(lib, dev_)
             lib = tvm.runtime.load_module(f'{models_path}/format_cond.so')
-            self.format_conditional = relax.VirtualMachine(lib, dev_)
+            self.format_conditional = relax.VirtualMachine(lib, dev_,
+                                                           memory_cfg={self.dev:relax.VirtualMachine.LRUCACHE_ALLOCATOR})
 
         self.hifi_decoder = HifiganGenerator(in_channels=1024, out_channels = 1, resblock_type = "1",
         resblock_dilation_sizes = [[1, 3, 5], [1, 3, 5], [1, 3, 5]], resblock_kernel_sizes = [3, 7, 11],
