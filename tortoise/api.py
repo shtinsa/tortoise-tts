@@ -156,8 +156,6 @@ def do_spectrogram_diffusion(diffusion_model, diffuser, latents, conditioning_la
                                       model_kwargs={'precomputed_aligned_embeddings': precomputed_embeddings},
                                      progress=verbose)
         if 'USE_TVM_MODEL' in os.environ.keys():
-            del noise
-            del precomputed_embeddings
             mel = torch.Tensor(np.transpose(mel.numpy().astype("float32"), (0, 2, 1))).to("cuda")
 
         return denormalize_tacotron_mel(mel)[:,:,:output_seq_len]
