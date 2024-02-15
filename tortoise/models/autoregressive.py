@@ -61,8 +61,9 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
             self.vm = relax.VirtualMachine(lib, self.dev, memory_cfg={self.dev:relax.VirtualMachine.LRUCACHE_ALLOCATOR})
             self.kv_caches = None
             self.shape = 0
-            self.offset = 2
+            self.offset = nd.array(np.array([2], dtype=np.int32), self.dev)
             self.fake_out = (([1],),)
+            # self.seq_len_shape = runtime.ShapeTuple([self.shape])
 
     def parallelize(self, device_map=None):
         self.device_map = (
@@ -155,25 +156,26 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
                 self.kv_caches = self.vm[f"create_kv_cache_{batch}"]()
             if input_ids.shape[1] != 1:
                 self.shape = self.cached_mel_emb.shape[1]
-                self.offset = 2
+                self.offset = nd.array(np.array([2]).astype(np.int32), self.dev)
                 seq_len_shape = runtime.ShapeTuple([self.shape])
                 res = self.vm[f"tortoise_autoregressive_{batch}"](
                                                          seq_len_shape,
                                                          self.cached_mel_emb,
                                                          self.kv_caches)
             else:
+                # print(self.shape)
                 self.shape += 1
                 input = nd.array(input_ids.cpu().numpy().astype(np.int32), self.dev)
-                offset = nd.array(np.array([self.offset]).astype(np.int32), self.dev)
+                # offset = nd.array(self.offset, self.dev)
 
                 seq_len_shape = runtime.ShapeTuple([self.shape])
 
                 res = self.vm[f"tortoise_autoregressive_step_{batch}"](
                                                               seq_len_shape,
                                                               input,
-                                                              offset,
+                                                              self.offset,
                                                               self.kv_caches)
-                self.offset += 1
+                self.offset = res[1]
             lm_logits = torch.from_dlpack(res[0].to_dlpack())
             transformer_outputs = CausalLMOutputWithCrossAttentions()
             transformer_outputs.past_key_values = self.fake_out # to avoid changes in other code

@@ -279,7 +279,7 @@ class TextToSpeech:
                             num_speech_tokens=8192, speech_enc_depth=20, speech_heads=12, speech_seq_len=430,
                             use_xformers=True).cpu().eval()
             self.clvp.load_state_dict(torch.load(get_model_path('clvp2.pth', models_dir)))
-            self.clvp = self.clvp.to("cuda")
+            # self.clvp = self.clvp.to("cuda")
 
         else:
             lib = tvm.runtime.load_module(f'{models_path}/clvp_{target.kind.name}_0_float16.so')
@@ -291,7 +291,7 @@ class TextToSpeech:
         if "USE_TVM_MODEL" not in os.environ:
             self.vocoder.load_state_dict(torch.load(get_model_path('vocoder.pth', models_dir), map_location=torch.device('cpu'))['model_g'])
             self.vocoder.eval(inference=True)
-            self.vocoder = self.vocoder.to("cuda")
+            # self.vocoder = self.vocoder.to("cuda")
 
         # Random latent generators (RLGs) are loaded lazily.
         self.rlg_auto = None
